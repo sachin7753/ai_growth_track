@@ -1,3 +1,4 @@
+# ------------------- IMPORTS -------------------
 import pandas as pd
 import numpy as np
 import re
@@ -8,17 +9,17 @@ from functools import lru_cache
 import joblib
 import os
 import json
-from datetime import datetime
-from reportlab.pdfgen import canvas
+from io import BytesIO
 from reportlab.lib.pagesizes import A4
+from reportlab.pdfgen import canvas
+from reportlab.lib.units import cm
 from reportlab.lib import colors
-from reportlab.lib.units import mm
-from textwrap import wrap
+import matplotlib.pyplot as plt
 
-# -------- PAGE CONFIG --------
+# ------------------- PAGE CONFIG -------------------
 st.set_page_config(page_title="Child Growth Advisor", page_icon="🧒", layout="wide")
 
-# -------- CONFIG & CONSTANTS --------
+# ------------------- CONFIG & CONSTANTS -------------------
 HFA_BOYS_FILE = "tab_hfa_boys_p_0_5.xlsx"
 HFA_GIRLS_FILE = "tab_hfa_girls_p_0_5.xlsx"
 WFH_BOYS_FILE = "tab_wfh_boys_p_0_5.xlsx"
@@ -29,7 +30,7 @@ PARAMS_PATH = "best_params.json"
 DAYS_PER_MONTH = 30.4375
 CLASS_LABELS = {0:"Underweight", 1:"Healthy", 2:"Overweight", 3:"Obese", 4:"Stunted", 5:"Normal Ht"}
 
-# -------- AI MODEL DEFINITION (Must match train.py) --------
+# ------------------- AI MODEL -------------------
 class GrowthNet(nn.Module):
     def __init__(self, n_layers=2, n_units=64, dropout_rate=0.3):
         super().__init__()
@@ -43,12 +44,13 @@ class GrowthNet(nn.Module):
     def forward(self, x):
         return self.model(x)
 
-# -------- CACHED FUNCTIONS --------
+# ------------------- LOAD MODEL & SCALER -------------------
 @st.cache_resource
 def load_model_and_scaler(model_path: str, scaler_path: str, params_path: str):
     try:
         with open(params_path, 'r') as f:
             best_params = json.load(f)
+        
         model = GrowthNet(
             n_layers=best_params['n_layers'],
             n_units=best_params['n_units'],
@@ -56,6 +58,7 @@ def load_model_and_scaler(model_path: str, scaler_path: str, params_path: str):
         )
         model.load_state_dict(torch.load(model_path))
         model.eval()
+        
         scaler = joblib.load(scaler_path)
         return model, scaler
     except FileNotFoundError as e:
@@ -72,10 +75,10 @@ def load_ref(path: str, primary_col_regex: str) -> tuple[pd.DataFrame, list[str]
         df = df[[primary_col] + pcols].copy(); df.columns = ["primary"] + pcols
         return df, pcols
     except FileNotFoundError:
-        st.error(f"Dataset file not found: '{path}'.")
+        st.error(f"Dataset file not found: '{path}'. Please ensure all .xlsx files are present.")
         return None, None
 
-# -------- CALCULATION LOGIC --------
+# ------------------- CORE CALCULATION -------------------
 def interp_curve(ref_df: pd.DataFrame, pcols: list[str], val: float) -> dict[float, float]:
     values = ref_df.iloc[:, 0].values.astype(float)
     if val <= values.min(): row = ref_df.iloc[0]
@@ -97,12 +100,15 @@ def ai_predict(model: GrowthNet, scaler, age_m: int, ht: float, wt: float, sex: 
     input_data = np.array([[age_m, ht, wt, 1 if sex == "M" else 0]])
     input_scaled = scaler.transform(input_data)
     x = torch.tensor(input_scaled, dtype=torch.float32)
+
     with torch.no_grad():
         logits = model(x); probabilities = torch.softmax(logits, dim=1)
         confidence, pred_idx_tensor = torch.max(probabilities, dim=1)
         pred_idx = pred_idx_tensor.item(); confidence_score = confidence.item()
+
     status = CLASS_LABELS.get(pred_idx, "Unknown")
     bmi = wt / ((ht / 100) ** 2)
+    
     if wfh_p < 3: status = "Underweight"
     elif wfh_p > 85: status = "Obese" if bmi >= 30 else "Overweight"
     elif bmi >= 30: status = "Obese"
@@ -111,33 +117,31 @@ def ai_predict(model: GrowthNet, scaler, age_m: int, ht: float, wt: float, sex: 
     elif status == "Underweight" and wfh_p >= 5 and hfa_p < 5: status = "Stunted"
     return status, confidence_score
 
+# ------------------- AI RECOMMENDATIONS -------------------
 def get_ai_recommendations(status: str, age_m: int, wfh_p: float, hfa_p: float, bmi: float) -> list[str]:
     recs = []
+    recs.append(f"**Status: {status}** (BMI: {bmi:.1f} | Wt-for-Ht: P{wfh_p:.1f})")
+    
     if status in ["Obese", "Overweight"]:
-        recs.append(f"Status: {status} (BMI: {bmi:.1f} | Wt-for-Ht: P{wfh_p:.1f})")
-        if bmi >= 35: recs.append("- Immediate pediatric consultation is critical.")
-        else: recs.append("- Pediatric consultation recommended.")
-        if age_m < 24: recs.append("- Nutrition: Avoid sugary drinks/snacks. Prioritize whole foods.")
-        else: recs.append("- Encourage ≥60 minutes of active play daily; limit screen time.")
-        if hfa_p < 5: recs.append("- Special Note: Child is overweight & stunted. Focus on nutrient-dense foods.")
+        recs.append("- Encourage balanced meals with vegetables, fruits, and lean proteins.")
+        recs.append("- Avoid sugary drinks and high-calorie snacks.")
+        recs.append("- Ensure at least 60 minutes of physical activity daily.")
+        recs.append("- Schedule pediatric consultation if BMI > 30 or rapid weight gain.")
     elif status == "Underweight":
-        recs.append(f"Status: Underweight (Weight-for-Height: P{wfh_p:.1f})")
-        if wfh_p < 1: recs.append("- Severe Wasting: Medical evaluation urgently needed.")
-        else: recs.append("- Nutrition: Increase intake of energy-dense foods.")
-        if age_m <= 12: recs.append("- Offer nutrient-rich first foods; do not restrict healthy fats.")
-        else: recs.append("- Offer frequent, small meals rich in protein and healthy fats.")
+        recs.append("- Increase intake of nutrient-dense foods such as nuts, dairy, and eggs.")
+        recs.append("- Frequent small meals may help gain weight.")
+        recs.append("- Monitor growth monthly to track improvement.")
     elif status == "Stunted":
-        recs.append(f"Status: Stunted (Height-for-Age: P{hfa_p:.1f})")
-        recs.append("- Nutrition: Focus on iron, zinc, and vitamin A rich foods.")
-        recs.append("- Food Sources: Eggs, dairy, leafy greens, lentils.")
-        recs.append("- Next Steps: Medical evaluation for supplements recommended.")
+        recs.append("- Focus on iron, zinc, vitamin A-rich foods (eggs, greens, dairy).")
+        recs.append("- Ensure adequate protein intake.")
+        recs.append("- Pediatric evaluation for possible supplements recommended.")
     else:
-        recs.append("Status: Healthy Growth Track")
-        recs.append("- Continue providing balanced diet and regular meal times.")
-        recs.append("- Encourage at least 60 minutes of varied play daily.")
-        recs.append("- Maintain regular pediatric check-ups.")
+        recs.append("- Continue balanced diet and regular meal times.")
+        recs.append("- Encourage 60+ minutes of daily active play.")
+        recs.append("- Regular pediatric check-ups are important.")
     return recs
 
+# ------------------- REPORT GENERATION -------------------
 def generate_report(age_m: int, ht: float, wt: float, sex: str, model: GrowthNet, scaler) -> dict:
     hfa_ref, hfa_pcols = load_ref(HFA_BOYS_FILE if sex == "M" else HFA_GIRLS_FILE, r'age|day|month')
     wfh_ref, wfh_pcols = load_ref(WFH_BOYS_FILE if sex == "M" else WFH_GIRLS_FILE, r'height|length')
@@ -152,72 +156,97 @@ def generate_report(age_m: int, ht: float, wt: float, sex: str, model: GrowthNet
     bmi = wt / ((ht / 100) ** 2)
     
     who_msgs = []
-    if wfh_p < 3: who_msgs.append(("Wt-for-height risk (P{:.1f})".format(wfh_p), colors.red))
-    elif wfh_p > 85: who_msgs.append(("Possible overweight (P{:.1f})".format(wfh_p), colors.red))
-    else: who_msgs.append(("Weight-for-height healthy", colors.green))
-    if hfa_p < 3: who_msgs.append(("Stunting risk (P{:.1f})".format(hfa_p), colors.red))
-    else: who_msgs.append(("Height-for-age healthy", colors.green))
+    if wfh_p < 3: who_msgs.append((f"Wasting risk (Weight-for-height at P{wfh_p:.1f})", colors.red))
+    elif wfh_p > 85: who_msgs.append((f"Possible overweight risk (Weight-for-height at P{wfh_p:.1f})", colors.red))
+    else: who_msgs.append(("Weight-for-height is in a healthy range.", colors.green))
+    if hfa_p < 3: who_msgs.append((f"Stunting risk (Height-for-age at P{hfa_p:.1f})", colors.red))
+    else: who_msgs.append(("Height-for-age is in a healthy range.", colors.green))
     
     recommendations = get_ai_recommendations(ai_status, age_m, wfh_p, hfa_p, bmi)
-    return {"wfh_p": wfh_p, "hfa_p": hfa_p, "bmi": bmi, "who_msgs": who_msgs, 
-            "recommendations": recommendations, "ai_status": ai_status, "confidence": confidence}
+    return {"wfh_p": wfh_p, "hfa_p": hfa_p, "bmi": bmi, "who_msgs": who_msgs, "recommendations": recommendations, "ai_status": ai_status, "confidence": confidence, "hfa_curve": hfa_curve, "wfh_curve": wfh_curve, "age_d": age_d, "ht": ht, "wt": wt}
 
-# -------- PDF GENERATION --------
-def save_report_pdf(child_name, age_m, height, weight, sex, report):
-    filename = f"{child_name.replace(' ','_')}_Growth_Report.pdf"
-    c = canvas.Canvas(filename, pagesize=A4)
-    width, height_page = A4
-    left_margin = 20 * mm
-    top_margin = height_page - 30 * mm
-    line_height = 10 * mm
+# ------------------- PDF WITH CHART -------------------
+def create_pdf_report(child_name: str, age_months: int, report: dict) -> BytesIO:
+    buffer = BytesIO()
+    c = canvas.Canvas(buffer, pagesize=A4)
+    width, height = A4
 
-    # Header
-    c.setFont("Helvetica-Bold", 20)
-    c.drawString(left_margin, top_margin, f"Child Growth Report: {child_name}")
+    # Title
+    c.setFont("Helvetica-Bold", 16)
+    c.drawString(3*cm, height-3*cm, f"Child Growth Report: {child_name}")
+
+    # Summary metrics
     c.setFont("Helvetica", 12)
-    c.drawString(left_margin, top_margin - 20, f"Date: {datetime.now().strftime('%Y-%m-%d')}")
-    c.drawString(left_margin, top_margin - 35, f"Age: {int(age_m)//12}y {int(age_m)%12}m | Sex: {'Male' if sex=='M' else 'Female'}")
-    c.drawString(left_margin, top_margin - 50, f"Height: {height} cm | Weight: {weight} kg | BMI: {report['bmi']:.1f}")
-
-    y_pos = top_margin - 70
+    c.drawString(3*cm, height-4*cm, f"Age: {int(age_months)//12}y {int(age_months)%12}m")
+    c.drawString(3*cm, height-4.7*cm, f"Height Percentile: P{report['hfa_p']:.1f}")
+    c.drawString(3*cm, height-5.4*cm, f"Weight-for-Height Percentile: P{report['wfh_p']:.1f}")
+    c.drawString(3*cm, height-6.1*cm, f"BMI: {report['bmi']:.1f}")
 
     # WHO Assessment
     c.setFont("Helvetica-Bold", 14)
-    c.drawString(left_margin, y_pos, "WHO Assessment")
-    y_pos -= 12
+    c.drawString(3*cm, height-7*cm, "WHO Assessment:")
     c.setFont("Helvetica", 12)
+    y = height-7.7*cm
     for msg, color in report['who_msgs']:
         c.setFillColor(color)
-        wrapped = wrap(msg, 90)
-        for line in wrapped:
-            c.drawString(left_margin, y_pos, "- " + line)
-            y_pos -= 12
+        c.drawString(4*cm, y, msg)
+        y -= 0.7*cm
     c.setFillColor(colors.black)
-    y_pos -= 10
 
     # AI Recommendations
     c.setFont("Helvetica-Bold", 14)
-    c.drawString(left_margin, y_pos, "AI Recommendations")
-    y_pos -= 12
+    c.drawString(3*cm, y-0.3*cm, "AI Recommendations:")
     c.setFont("Helvetica", 12)
-    for tip in report['recommendations']:
-        wrapped = wrap(tip, 90)
-        for line in wrapped:
-            c.drawString(left_margin, y_pos, "- " + line)
-            y_pos -= 12
+    y -= 1*cm
+    for rec in report['recommendations']:
+        c.drawString(4*cm, y, rec.replace("**",""))
+        y -= 0.7*cm
+        if y < 5*cm:
+            c.showPage(); y = height-3*cm
 
+    # ------------------- PLOT CHART -------------------
+    plt.figure(figsize=(6,4))
+    hfa_x = list(report['hfa_curve'].keys())
+    hfa_y = list(report['hfa_curve'].values())
+    wfh_x = list(report['wfh_curve'].keys())
+    wfh_y = list(report['wfh_curve'].values())
+
+    plt.plot(hfa_x, hfa_y, label='Height-for-age curve', color='green')
+    plt.scatter([report['ht']], [report['ht']], color='blue', label='Child Height')
+    plt.xlabel("Percentile")
+    plt.ylabel("Height (cm)")
+    plt.title("Height-for-Age Percentile")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig("hfa_chart.png"); plt.close()
+
+    plt.figure(figsize=(6,4))
+    plt.plot(wfh_x, wfh_y, label='Weight-for-height curve', color='orange')
+    plt.scatter([report['ht']], [report['wt']], color='red', label='Child Weight')
+    plt.xlabel("Percentile")
+    plt.ylabel("Weight (kg)")
+    plt.title("Weight-for-Height Percentile")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig("wfh_chart.png"); plt.close()
+
+    # Embed charts in PDF
+    c.showPage()
+    c.drawImage("hfa_chart.png", 2*cm, height/2, width=16*cm, height=9*cm)
+    c.drawImage("wfh_chart.png", 2*cm, 2*cm, width=16*cm, height=9*cm)
+
+    c.showPage()
     c.save()
-    return filename
+    buffer.seek(0)
+    return buffer
 
-# -------- STREAMLIT UI --------
-st.title("🧒 Hybrid AI Child Growth Advisor")
-st.markdown("Enter a child's measurements for a growth analysis based on WHO standards and AI recommendations.")
-
+# ------------------- STREAMLIT INTERFACE -------------------
+st.title("🧒 Hybrid AI Child Growth Advisor with PDF Charts")
 growth_model, scaler = load_model_and_scaler(MODEL_PATH, SCALER_PATH, PARAMS_PATH)
 
 with st.sidebar:
-    st.header("Child's Details")
-    child_name = st.text_input("Child Name", value="Child Name")
+    st.header("Child's Measurements")
+    child_name = st.text_input("Child's Name", value="John Doe")
     sex_options = {"Male": "M", "Female": "F"}
     sex_label = st.radio("Sex", options=sex_options.keys(), horizontal=True)
     sex = sex_options[sex_label]
@@ -246,15 +275,16 @@ if generate_button and growth_model and scaler:
             for msg, color in report['who_msgs']:
                 st.markdown(f"- {msg}")
         with col_ai:
-            st.subheader("🤖 AI Recommendations")
+            st.subheader(f"🤖 AI Recommendations")
             st.caption(f"Final Status: **{report['ai_status']}** | Model Confidence: **{report['confidence']:.1%}**")
-            for tip in report['recommendations']:
-                st.markdown(f"- {tip}")
+            for tip in report['recommendations']: st.markdown(f"- {tip}")
 
-        if st.button("Download PDF Report"):
-            pdf_file = save_report_pdf(child_name, int(age_months), height_cm, weight_kg, sex, report)
-            with open(pdf_file, "rb") as f:
-                st.download_button("Download PDF", f, file_name=pdf_file)
-
+        pdf_buffer = create_pdf_report(child_name, int(age_months), report)
+        st.download_button(
+            label="📄 Download PDF Report",
+            data=pdf_buffer,
+            file_name=f"{child_name.replace(' ', '_')}_Growth_Report.pdf",
+            mime="application/pdf"
+        )
 elif not (growth_model and scaler):
     st.warning("Cannot generate report because AI model or scaler is not loaded.")
