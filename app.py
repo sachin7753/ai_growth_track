@@ -14,6 +14,7 @@ from reportlab.lib.pagesizes import A4
 from reportlab.pdfgen import canvas
 from reportlab.lib.units import cm
 from reportlab.lib import colors
+import matplotlib.pyplot as plt
 
 # ------------------- PAGE CONFIG -------------------
 st.set_page_config(page_title="Child Growth Advisor", page_icon="🧒", layout="wide")
@@ -162,97 +163,4 @@ def generate_report(age_m: int, ht: float, wt: float, sex: str, model: GrowthNet
     else: who_msgs.append(("Height-for-age is in a healthy range.", colors.green))
     
     recommendations = get_ai_recommendations(ai_status, age_m, wfh_p, hfa_p, bmi)
-    return {"wfh_p": wfh_p, "hfa_p": hfa_p, "bmi": bmi, "who_msgs": who_msgs, "recommendations": recommendations, "ai_status": ai_status, "confidence": confidence}
-
-# ------------------- PDF GENERATION -------------------
-def create_pdf_report(child_name: str, age_months: int, report: dict) -> BytesIO:
-    buffer = BytesIO()
-    c = canvas.Canvas(buffer, pagesize=A4)
-    width, height = A4
-
-    c.setFont("Helvetica-Bold", 16)
-    c.drawString(3*cm, height-3*cm, f"Child Growth Report: {child_name}")
-
-    c.setFont("Helvetica", 12)
-    c.drawString(3*cm, height-4*cm, f"Age: {int(age_months)//12}y {int(age_months)%12}m")
-    c.drawString(3*cm, height-4.7*cm, f"Height Percentile: P{report['hfa_p']:.1f}")
-    c.drawString(3*cm, height-5.4*cm, f"Weight-for-Height Percentile: P{report['wfh_p']:.1f}")
-    c.drawString(3*cm, height-6.1*cm, f"BMI: {report['bmi']:.1f}")
-
-    c.setFont("Helvetica-Bold", 14)
-    c.drawString(3*cm, height-7*cm, "WHO Assessment:")
-    c.setFont("Helvetica", 12)
-    y = height-7.7*cm
-    for msg, color in report['who_msgs']:
-        c.setFillColor(color)
-        c.drawString(4*cm, y, msg)
-        y -= 0.7*cm
-
-    c.setFillColor(colors.black)
-    c.setFont("Helvetica-Bold", 14)
-    c.drawString(3*cm, y-0.3*cm, "AI Recommendations:")
-    c.setFont("Helvetica", 12)
-    y -= 1*cm
-    for rec in report['recommendations']:
-        c.drawString(4*cm, y, rec.replace("**",""))
-        y -= 0.7*cm
-        if y < 2*cm:
-            c.showPage(); y = height-3*cm
-
-    c.showPage()
-    c.save()
-    buffer.seek(0)
-    return buffer
-
-# ------------------- STREAMLIT INTERFACE -------------------
-st.title("🧒 Hybrid AI Child Growth Advisor")
-st.markdown("Enter a child's measurements for a growth analysis based on WHO standards and AI recommendations.")
-
-growth_model, scaler = load_model_and_scaler(MODEL_PATH, SCALER_PATH, PARAMS_PATH)
-
-with st.sidebar:
-    st.header("Child's Measurements")
-    child_name = st.text_input("Child's Name", value="John Doe")
-    sex_options = {"Male": "M", "Female": "F"}
-    sex_label = st.radio("Sex", options=sex_options.keys(), horizontal=True)
-    sex = sex_options[sex_label]
-
-    age_months = st.number_input("Age in Months", min_value=0, max_value=60, value=24, step=1)
-    height_cm = st.number_input("Height (cm)", min_value=40.0, max_value=130.0, value=85.0, step=0.1, format="%.1f")
-    weight_kg = st.number_input("Weight (kg)", min_value=1.0, max_value=40.0, value=12.0, step=0.1, format="%.1f")
-    
-    generate_button = st.button("Generate Report", type="primary", use_container_width=True)
-
-if generate_button and growth_model and scaler:
-    with st.spinner('Analyzing...'):
-        report = generate_report(int(age_months), float(height_cm), float(weight_kg), sex, growth_model, scaler)
-    if report:
-        st.header("Growth Report Summary")
-        col1, col2, col3, col4 = st.columns(4)
-        col1.metric("Age", f"{int(age_months) // 12}y {int(age_months) % 12}m")
-        col2.metric("Height Percentile", f"P{report['hfa_p']:.1f}")
-        col3.metric("Weight/Ht Percentile", f"P{report['wfh_p']:.1f}")
-        col4.metric("BMI", f"{report['bmi']:.1f}")
-        st.markdown("---")
-        
-        col_who, col_ai = st.columns(2)
-        with col_who:
-            st.subheader("📈 WHO Assessment")
-            for msg, color in report['who_msgs']:
-                st.markdown(f"- {msg}")
-        with col_ai:
-            st.subheader(f"🤖 AI Recommendations")
-            st.caption(f"Final Status: **{report['ai_status']}** | Model Confidence: **{report['confidence']:.1%}**")
-            for tip in report['recommendations']: st.markdown(f"- {tip}")
-
-        pdf_buffer = create_pdf_report(child_name, int(age_months), report)
-        st.download_button(
-            label="📄 Download PDF Report",
-            data=pdf_buffer,
-            file_name=f"{child_name.replace(' ', '_')}_Growth_Report.pdf",
-            mime="application/pdf"
-        )
-    else:
-        st.error("Could not generate report. Please check that all data files are present and measurements are realistic.")
-elif not (growth_model and scaler):
-    st.warning("Cannot generate report because AI model or scaler is not loaded. Please ensure required files are in the project folder.")
+    return {"wfh_p": wfh_p, "hfa_p": hfa_p, "bmi": bmi, "who_msgs": who_msgs, "recommendations": recommendations, "ai_status": ai_status, "confidence": confidence, "hfa_curve": hfa_curve, "wfh_curve": wfh_curve, "age_d": age_d, "ht": ht, "wt": wt}
