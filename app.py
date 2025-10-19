@@ -3,7 +3,7 @@ from pydrive2.auth import GoogleAuth
 from pydrive2.drive import GoogleDrive
 
 SERVICE_ACCOUNT_JSON = "service_account.json"  # path to your JSON
-FOLDER_ID = "YOUR_FOLDER_ID_HERE"  # put your folder ID here
+FOLDER_ID = "https://drive.google.com/drive/folders/1u9uDdhJ0Q8GolChkIk6-otOi6pYggTxP?usp=drive_link"  # put your folder ID here
 
 def drive_auth():
     gauth = GoogleAuth()
