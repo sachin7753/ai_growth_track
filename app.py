@@ -15,7 +15,7 @@ from reportlab.pdfgen import canvas
 from reportlab.lib.units import cm
 from reportlab.lib import colors
 import matplotlib.pyplot as plt
-import requests  # <-- For Wix integration
+import requests
 
 # ------------------- PAGE CONFIG -------------------
 st.set_page_config(page_title="Child Growth Advisor", page_icon="🧒", layout="wide")
@@ -43,10 +43,13 @@ class GrowthNet(nn.Module):
         layers = []
         in_features = 4
         for i in range(n_layers):
-            layers.append(nn.Linear(in_features, n_units)); layers.append(nn.ReLU()); layers.append(nn.Dropout(dropout_rate))
+            layers.append(nn.Linear(in_features, n_units))
+            layers.append(nn.ReLU())
+            layers.append(nn.Dropout(dropout_rate))
             in_features = n_units
         layers.append(nn.Linear(in_features, len(CLASS_LABELS)))
         self.model = nn.Sequential(*layers)
+
     def forward(self, x):
         return self.model(x)
 
@@ -90,16 +93,20 @@ def interp_curve(ref_df: pd.DataFrame, pcols: list[str], val: float) -> dict[flo
     if val <= values.min(): row = ref_df.iloc[0]
     elif val >= values.max(): row = ref_df.iloc[-1]
     else:
-        idx = np.searchsorted(values, val, side="right"); v0, v1 = values[idx-1], values[idx]
-        frac = (val - v0) / (v1 - v0); row0, row1 = ref_df.iloc[idx-1], ref_df.iloc[idx]
+        idx = np.searchsorted(values, val, side="right")
+        v0, v1 = values[idx-1], values[idx]
+        frac = (val - v0) / (v1 - v0)
+        row0, row1 = ref_df.iloc[idx-1], ref_df.iloc[idx]
         return {float(re.findall(r"\d+",c)[0]): row0[c]+frac*(row1[c]-row0[c]) for c in pcols}
     return {float(re.findall(r"\d+",c)[0]): float(row[c]) for c in pcols}
 
 def est_percentile(value: float, curve: dict[float, float]) -> float:
-    pts = sorted(curve.items(), key=lambda item: item[1]); values=[v for p,v in pts]; percs=[p for p,v in pts]
+    pts = sorted(curve.items(), key=lambda item: item[1])
+    values=[v for p,v in pts]; percs=[p for p,v in pts]
     if value <= values[0]: return percs[0]
     if value >= values[-1]: return percs[-1]
-    j = np.searchsorted(values, value, side="right"); v0,v1,p0,p1 = values[j-1],values[j],percs[j-1],percs[j]
+    j = np.searchsorted(values, value, side="right")
+    v0,v1,p0,p1 = values[j-1],values[j],percs[j-1],percs[j]
     return p0 + (value - v0) / (v1 - v0) * (p1 - p0)
 
 def ai_predict(model: GrowthNet, scaler, age_m: int, ht: float, wt: float, sex: str, wfh_p: float, hfa_p: float) -> tuple[str, float]:
@@ -108,9 +115,11 @@ def ai_predict(model: GrowthNet, scaler, age_m: int, ht: float, wt: float, sex: 
     x = torch.tensor(input_scaled, dtype=torch.float32)
 
     with torch.no_grad():
-        logits = model(x); probabilities = torch.softmax(logits, dim=1)
+        logits = model(x)
+        probabilities = torch.softmax(logits, dim=1)
         confidence, pred_idx_tensor = torch.max(probabilities, dim=1)
-        pred_idx = pred_idx_tensor.item(); confidence_score = confidence.item()
+        pred_idx = pred_idx_tensor.item()
+        confidence_score = confidence.item()
 
     status = CLASS_LABELS.get(pred_idx, "Unknown")
     bmi = wt / ((ht / 100) ** 2)
@@ -125,26 +134,32 @@ def ai_predict(model: GrowthNet, scaler, age_m: int, ht: float, wt: float, sex: 
 
 # ------------------- AI RECOMMENDATIONS -------------------
 def get_ai_recommendations(status: str, age_m: int, wfh_p: float, hfa_p: float, bmi: float) -> list[str]:
-    recs = []
-    recs.append(f"**Status: {status}** (BMI: {bmi:.1f} | Wt-for-Ht: P{wfh_p:.1f})")
-    
+    recs = [f"**Status: {status}** (BMI: {bmi:.1f} | Wt-for-Ht: P{wfh_p:.1f})"]
     if status in ["Obese", "Overweight"]:
-        recs.append("- Encourage balanced meals with vegetables, fruits, and lean proteins.")
-        recs.append("- Avoid sugary drinks and high-calorie snacks.")
-        recs.append("- Ensure at least 60 minutes of physical activity daily.")
-        recs.append("- Schedule pediatric consultation if BMI > 30 or rapid weight gain.")
+        recs += [
+            "- Encourage balanced meals with vegetables, fruits, and lean proteins.",
+            "- Avoid sugary drinks and high-calorie snacks.",
+            "- Ensure at least 60 minutes of physical activity daily.",
+            "- Schedule pediatric consultation if BMI > 30 or rapid weight gain."
+        ]
     elif status == "Underweight":
-        recs.append("- Increase intake of nutrient-dense foods such as nuts, dairy, and eggs.")
-        recs.append("- Frequent small meals may help gain weight.")
-        recs.append("- Monitor growth monthly to track improvement.")
+        recs += [
+            "- Increase intake of nutrient-dense foods such as nuts, dairy, and eggs.",
+            "- Frequent small meals may help gain weight.",
+            "- Monitor growth monthly to track improvement."
+        ]
     elif status == "Stunted":
-        recs.append("- Focus on iron, zinc, vitamin A-rich foods (eggs, greens, dairy).")
-        recs.append("- Ensure adequate protein intake.")
-        recs.append("- Pediatric evaluation for possible supplements recommended.")
+        recs += [
+            "- Focus on iron, zinc, vitamin A-rich foods (eggs, greens, dairy).",
+            "- Ensure adequate protein intake.",
+            "- Pediatric evaluation for possible supplements recommended."
+        ]
     else:
-        recs.append("- Continue balanced diet and regular meal times.")
-        recs.append("- Encourage 60+ minutes of daily active play.")
-        recs.append("- Regular pediatric check-ups are important.")
+        recs += [
+            "- Continue balanced diet and regular meal times.",
+            "- Encourage 60+ minutes of daily active play.",
+            "- Regular pediatric check-ups are important."
+        ]
     return recs
 
 # ------------------- REPORT GENERATION -------------------
@@ -162,22 +177,22 @@ def generate_report(age_m: int, ht: float, wt: float, sex: str, model: GrowthNet
     bmi = wt / ((ht / 100) ** 2)
     
     who_msgs = []
-    if wfh_p < 3: who_msgs.append((f"Wasting risk (Weight-for-height at P{wfh_p:.1f})", colors.red))
-    elif wfh_p > 85: who_msgs.append((f"Possible overweight risk (Weight-for-height at P{wfh_p:.1f})", colors.red))
-    else: who_msgs.append(("Weight-for-height is in a healthy range.", colors.green))
-    if hfa_p < 3: who_msgs.append((f"Stunting risk (Height-for-age at P{hfa_p:.1f})", colors.red))
-    else: who_msgs.append(("Height-for-age is in a healthy range.", colors.green))
-    
-    recommendations = get_ai_recommendations(ai_status, age_m, wfh_p, hfa_p, bmi)
-    return {"wfh_p": wfh_p, "hfa_p": hfa_p, "bmi": bmi, "who_msgs": who_msgs, "recommendations": recommendations, "ai_status": ai_status, "confidence": confidence, "hfa_curve": hfa_curve, "wfh_curve": wfh_curve, "age_d": age_d, "ht": ht, "wt": wt}
+    who_msgs.append((f"Wasting risk (Weight-for-height at P{wfh_p:.1f})", colors.red) if wfh_p < 3 else
+                    (f"Possible overweight risk (Weight-for-height at P{wfh_p:.1f})", colors.red) if wfh_p > 85 else
+                    ("Weight-for-height is in a healthy range.", colors.green))
+    who_msgs.append((f"Stunting risk (Height-for-age at P{hfa_p:.1f})", colors.red) if hfa_p < 3 else
+                    ("Height-for-age is in a healthy range.", colors.green))
 
-# ------------------- PDF WITH CHART -------------------
+    recommendations = get_ai_recommendations(ai_status, age_m, wfh_p, hfa_p, bmi)
+    return {"wfh_p": wfh_p, "hfa_p": hfa_p, "bmi": bmi, "who_msgs": who_msgs, "recommendations": recommendations,
+            "ai_status": ai_status, "confidence": confidence, "hfa_curve": hfa_curve, "wfh_curve": wfh_curve,
+            "age_d": age_d, "ht": ht, "wt": wt}
+
+# ------------------- PDF GENERATION -------------------
 def create_pdf_report(child_name: str, age_months: int, report: dict) -> BytesIO:
     buffer = BytesIO()
     c = canvas.Canvas(buffer, pagesize=A4)
     width, height = A4
-
-    # Title & metrics (same as before)
     c.setFont("Helvetica-Bold", 16)
     c.drawString(3*cm, height-3*cm, f"Child Growth Report: {child_name}")
     c.setFont("Helvetica", 12)
@@ -186,7 +201,6 @@ def create_pdf_report(child_name: str, age_months: int, report: dict) -> BytesIO
     c.drawString(3*cm, height-5.4*cm, f"Weight-for-Height Percentile: P{report['wfh_p']:.1f}")
     c.drawString(3*cm, height-6.1*cm, f"BMI: {report['bmi']:.1f}")
 
-    # WHO Assessment & AI Recommendations
     y = height-7.7*cm
     c.setFont("Helvetica-Bold", 14); c.drawString(3*cm, height-7*cm, "WHO Assessment:"); c.setFont("Helvetica", 12)
     for msg, color in report['who_msgs']:
@@ -195,7 +209,7 @@ def create_pdf_report(child_name: str, age_months: int, report: dict) -> BytesIO
     c.setFont("Helvetica-Bold", 14); c.drawString(3*cm, y-0.3*cm, "AI Recommendations:"); c.setFont("Helvetica", 12)
     y -= 1*cm
     for rec in report['recommendations']:
-        c.drawString(4*cm, y, rec.replace("**","")); y -= 0.7*cm; 
+        c.drawString(4*cm, y, rec.replace("**","")); y -= 0.7*cm
         if y < 5*cm: c.showPage(); y = height-3*cm
 
     c.showPage(); c.save(); buffer.seek(0)
