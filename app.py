@@ -5,16 +5,13 @@ import re
 import torch
 import torch.nn as nn
 import streamlit as st
-from functools import lru_cache
 import joblib
-import os
 import json
 from io import BytesIO
 from reportlab.lib.pagesizes import A4
 from reportlab.pdfgen import canvas
 from reportlab.lib.units import cm
 from reportlab.lib import colors
-import matplotlib.pyplot as plt
 import requests
 
 # ------------------- PAGE CONFIG -------------------
@@ -31,9 +28,7 @@ PARAMS_PATH = "best_params.json"
 DAYS_PER_MONTH = 30.4375
 CLASS_LABELS = {0:"Underweight", 1:"Healthy", 2:"Overweight", 3:"Obese", 4:"Stunted", 5:"Normal Ht"}
 
-# ------------------- WIX CONFIG -------------------
-WIX_MEDIA_UPLOAD_URL = "https://www.wixapis.com/media/v1/upload/file"  # Wix Media API
-WIX_API_KEY = "YOUR_WIX_API_KEY"  # Replace with your Wix API Key
+# ------------------- WIX HTTP FUNCTION -------------------
 WIX_HTTP_FUNCTION_URL = "https://yourwixsite.com/_functions/addReport"  # Replace with your HTTP Function URL
 
 # ------------------- AI MODEL -------------------
@@ -55,11 +50,10 @@ class GrowthNet(nn.Module):
 
 # ------------------- LOAD MODEL & SCALER -------------------
 @st.cache_resource
-def load_model_and_scaler(model_path: str, scaler_path: str, params_path: str):
+def load_model_and_scaler(model_path, scaler_path, params_path):
     try:
         with open(params_path, 'r') as f:
             best_params = json.load(f)
-        
         model = GrowthNet(
             n_layers=best_params['n_layers'],
             n_units=best_params['n_units'],
@@ -67,172 +61,145 @@ def load_model_and_scaler(model_path: str, scaler_path: str, params_path: str):
         )
         model.load_state_dict(torch.load(model_path))
         model.eval()
-        
         scaler = joblib.load(scaler_path)
         return model, scaler
     except FileNotFoundError as e:
-        st.error(f"Required file not found: {e}. Please run train.py first.")
+        st.error(f"Required file not found: {e}")
         return None, None
 
 @st.cache_data
-def load_ref(path: str, primary_col_regex: str) -> tuple[pd.DataFrame, list[str]]:
+def load_ref(path, primary_col_regex):
     try:
         df = pd.read_excel(path)
         primary_col = next((c for c in df.columns if re.search(primary_col_regex, str(c), re.I)), None)
-        if not primary_col: raise ValueError(f"No primary column found in {path}")
+        if not primary_col: raise ValueError(f"No primary column in {path}")
         pcols = [c for c in df.columns if re.match(r"P\d+", str(c))]
-        df = df[[primary_col] + pcols].copy(); df.columns = ["primary"] + pcols
+        df = df[[primary_col]+pcols]; df.columns = ["primary"]+pcols
         return df, pcols
     except FileNotFoundError:
-        st.error(f"Dataset file not found: '{path}'. Please ensure all .xlsx files are present.")
+        st.error(f"Dataset not found: {path}")
         return None, None
 
 # ------------------- CORE CALCULATION -------------------
-def interp_curve(ref_df: pd.DataFrame, pcols: list[str], val: float) -> dict[float, float]:
-    values = ref_df.iloc[:, 0].values.astype(float)
+def interp_curve(ref_df, pcols, val):
+    values = ref_df.iloc[:,0].values.astype(float)
     if val <= values.min(): row = ref_df.iloc[0]
     elif val >= values.max(): row = ref_df.iloc[-1]
     else:
         idx = np.searchsorted(values, val, side="right")
-        v0, v1 = values[idx-1], values[idx]
-        frac = (val - v0) / (v1 - v0)
-        row0, row1 = ref_df.iloc[idx-1], ref_df.iloc[idx]
+        v0,v1 = values[idx-1], values[idx]
+        frac = (val-v0)/(v1-v0)
+        row0,row1 = ref_df.iloc[idx-1], ref_df.iloc[idx]
         return {float(re.findall(r"\d+",c)[0]): row0[c]+frac*(row1[c]-row0[c]) for c in pcols}
     return {float(re.findall(r"\d+",c)[0]): float(row[c]) for c in pcols}
 
-def est_percentile(value: float, curve: dict[float, float]) -> float:
-    pts = sorted(curve.items(), key=lambda item: item[1])
+def est_percentile(value, curve):
+    pts = sorted(curve.items(), key=lambda item:item[1])
     values=[v for p,v in pts]; percs=[p for p,v in pts]
-    if value <= values[0]: return percs[0]
-    if value >= values[-1]: return percs[-1]
+    if value<=values[0]: return percs[0]
+    if value>=values[-1]: return percs[-1]
     j = np.searchsorted(values, value, side="right")
     v0,v1,p0,p1 = values[j-1],values[j],percs[j-1],percs[j]
-    return p0 + (value - v0) / (v1 - v0) * (p1 - p0)
+    return p0+(value-v0)/(v1-v0)*(p1-p0)
 
-def ai_predict(model: GrowthNet, scaler, age_m: int, ht: float, wt: float, sex: str, wfh_p: float, hfa_p: float) -> tuple[str, float]:
-    input_data = np.array([[age_m, ht, wt, 1 if sex == "M" else 0]])
+def ai_predict(model, scaler, age_m, ht, wt, sex, wfh_p, hfa_p):
+    input_data = np.array([[age_m, ht, wt, 1 if sex=="M" else 0]])
     input_scaled = scaler.transform(input_data)
     x = torch.tensor(input_scaled, dtype=torch.float32)
-
     with torch.no_grad():
         logits = model(x)
         probabilities = torch.softmax(logits, dim=1)
         confidence, pred_idx_tensor = torch.max(probabilities, dim=1)
         pred_idx = pred_idx_tensor.item()
         confidence_score = confidence.item()
-
     status = CLASS_LABELS.get(pred_idx, "Unknown")
-    bmi = wt / ((ht / 100) ** 2)
-    
-    if wfh_p < 3: status = "Underweight"
-    elif wfh_p > 85: status = "Obese" if bmi >= 30 else "Overweight"
-    elif bmi >= 30: status = "Obese"
-    elif bmi >= 25: status = "Overweight"
-    elif hfa_p < 3 and status in ["Healthy", "Normal Ht"]: status = "Stunted"
-    elif status == "Underweight" and wfh_p >= 5 and hfa_p < 5: status = "Stunted"
+    bmi = wt/((ht/100)**2)
+    if wfh_p<3: status="Underweight"
+    elif wfh_p>85: status="Obese" if bmi>=30 else "Overweight"
+    elif bmi>=30: status="Obese"
+    elif bmi>=25: status="Overweight"
+    elif hfa_p<3 and status in ["Healthy","Normal Ht"]: status="Stunted"
+    elif status=="Underweight" and wfh_p>=5 and hfa_p<5: status="Stunted"
     return status, confidence_score
 
 # ------------------- AI RECOMMENDATIONS -------------------
-def get_ai_recommendations(status: str, age_m: int, wfh_p: float, hfa_p: float, bmi: float) -> list[str]:
+def get_ai_recommendations(status, age_m, wfh_p, hfa_p, bmi):
     recs = [f"**Status: {status}** (BMI: {bmi:.1f} | Wt-for-Ht: P{wfh_p:.1f})"]
-    if status in ["Obese", "Overweight"]:
-        recs += [
-            "- Encourage balanced meals with vegetables, fruits, and lean proteins.",
-            "- Avoid sugary drinks and high-calorie snacks.",
-            "- Ensure at least 60 minutes of physical activity daily.",
-            "- Schedule pediatric consultation if BMI > 30 or rapid weight gain."
-        ]
-    elif status == "Underweight":
-        recs += [
-            "- Increase intake of nutrient-dense foods such as nuts, dairy, and eggs.",
-            "- Frequent small meals may help gain weight.",
-            "- Monitor growth monthly to track improvement."
-        ]
-    elif status == "Stunted":
-        recs += [
-            "- Focus on iron, zinc, vitamin A-rich foods (eggs, greens, dairy).",
-            "- Ensure adequate protein intake.",
-            "- Pediatric evaluation for possible supplements recommended."
-        ]
+    if status in ["Obese","Overweight"]:
+        recs += ["- Balanced meals (veg, fruits, lean protein)",
+                 "- Avoid sugary drinks/snacks",
+                 "- 60min+ physical activity daily",
+                 "- Pediatric consultation if BMI>30"]
+    elif status=="Underweight":
+        recs += ["- Nutrient-dense foods (nuts, dairy, eggs)",
+                 "- Frequent small meals",
+                 "- Monitor growth monthly"]
+    elif status=="Stunted":
+        recs += ["- Iron, zinc, vitamin A foods",
+                 "- Adequate protein",
+                 "- Pediatric evaluation"]
     else:
-        recs += [
-            "- Continue balanced diet and regular meal times.",
-            "- Encourage 60+ minutes of daily active play.",
-            "- Regular pediatric check-ups are important."
-        ]
+        recs += ["- Continue balanced diet",
+                 "- 60+ mins daily play",
+                 "- Regular pediatric checkups"]
     return recs
 
 # ------------------- REPORT GENERATION -------------------
-def generate_report(age_m: int, ht: float, wt: float, sex: str, model: GrowthNet, scaler) -> dict:
-    hfa_ref, hfa_pcols = load_ref(HFA_BOYS_FILE if sex == "M" else HFA_GIRLS_FILE, r'age|day|month')
-    wfh_ref, wfh_pcols = load_ref(WFH_BOYS_FILE if sex == "M" else WFH_GIRLS_FILE, r'height|length')
+def generate_report(age_m, ht, wt, sex, model, scaler):
+    hfa_ref, hfa_pcols = load_ref(HFA_BOYS_FILE if sex=="M" else HFA_GIRLS_FILE,r'age|day|month')
+    wfh_ref, wfh_pcols = load_ref(WFH_BOYS_FILE if sex=="M" else WFH_GIRLS_FILE,r'height|length')
     if hfa_ref is None or wfh_ref is None: return None
-
-    age_d = age_m * DAYS_PER_MONTH
-    hfa_curve = interp_curve(hfa_ref, hfa_pcols, age_d)
-    hfa_p = est_percentile(ht, hfa_curve)
-    wfh_curve = interp_curve(wfh_ref, wfh_pcols, ht)
-    wfh_p = est_percentile(wt, wfh_curve)
+    age_d = age_m*30.4375
+    hfa_curve = interp_curve(hfa_ref,hfa_pcols,age_d)
+    hfa_p = est_percentile(ht,hfa_curve)
+    wfh_curve = interp_curve(wfh_ref,wfh_pcols,ht)
+    wfh_p = est_percentile(wt,wfh_curve)
     ai_status, confidence = ai_predict(model, scaler, age_m, ht, wt, sex, wfh_p, hfa_p)
-    bmi = wt / ((ht / 100) ** 2)
-    
-    who_msgs = []
-    who_msgs.append((f"Wasting risk (Weight-for-height at P{wfh_p:.1f})", colors.red) if wfh_p < 3 else
-                    (f"Possible overweight risk (Weight-for-height at P{wfh_p:.1f})", colors.red) if wfh_p > 85 else
-                    ("Weight-for-height is in a healthy range.", colors.green))
-    who_msgs.append((f"Stunting risk (Height-for-age at P{hfa_p:.1f})", colors.red) if hfa_p < 3 else
-                    ("Height-for-age is in a healthy range.", colors.green))
-
+    bmi = wt/((ht/100)**2)
+    who_msgs=[]
+    who_msgs.append((f"Wasting risk (P{wfh_p:.1f})",colors.red) if wfh_p<3 else
+                    (f"Overweight risk (P{wfh_p:.1f})",colors.red) if wfh_p>85 else
+                    ("Weight-for-height healthy",colors.green))
+    who_msgs.append((f"Stunting risk (P{hfa_p:.1f})",colors.red) if hfa_p<3 else ("Height healthy",colors.green))
     recommendations = get_ai_recommendations(ai_status, age_m, wfh_p, hfa_p, bmi)
-    return {"wfh_p": wfh_p, "hfa_p": hfa_p, "bmi": bmi, "who_msgs": who_msgs, "recommendations": recommendations,
-            "ai_status": ai_status, "confidence": confidence, "hfa_curve": hfa_curve, "wfh_curve": wfh_curve,
-            "age_d": age_d, "ht": ht, "wt": wt}
+    return {"wfh_p":wfh_p,"hfa_p":hfa_p,"bmi":bmi,"who_msgs":who_msgs,"recommendations":recommendations,
+            "ai_status":ai_status,"confidence":confidence,"age_d":age_d,"ht":ht,"wt":wt}
 
 # ------------------- PDF GENERATION -------------------
-def create_pdf_report(child_name: str, age_months: int, report: dict) -> BytesIO:
+def create_pdf_report(child_name, age_months, report):
     buffer = BytesIO()
     c = canvas.Canvas(buffer, pagesize=A4)
-    width, height = A4
-    c.setFont("Helvetica-Bold", 16)
-    c.drawString(3*cm, height-3*cm, f"Child Growth Report: {child_name}")
-    c.setFont("Helvetica", 12)
-    c.drawString(3*cm, height-4*cm, f"Age: {int(age_months)//12}y {int(age_months)%12}m")
-    c.drawString(3*cm, height-4.7*cm, f"Height Percentile: P{report['hfa_p']:.1f}")
-    c.drawString(3*cm, height-5.4*cm, f"Weight-for-Height Percentile: P{report['wfh_p']:.1f}")
-    c.drawString(3*cm, height-6.1*cm, f"BMI: {report['bmi']:.1f}")
-
+    width,height=A4
+    c.setFont("Helvetica-Bold",16); c.drawString(3*cm,height-3*cm,f"Child Growth Report: {child_name}")
+    c.setFont("Helvetica",12)
+    c.drawString(3*cm,height-4*cm,f"Age: {int(age_months)//12}y {int(age_months)%12}m")
+    c.drawString(3*cm,height-4.7*cm,f"Height Percentile: P{report['hfa_p']:.1f}")
+    c.drawString(3*cm,height-5.4*cm,f"Weight-for-Height Percentile: P{report['wfh_p']:.1f}")
+    c.drawString(3*cm,height-6.1*cm,f"BMI: {report['bmi']:.1f}")
     y = height-7.7*cm
-    c.setFont("Helvetica-Bold", 14); c.drawString(3*cm, height-7*cm, "WHO Assessment:"); c.setFont("Helvetica", 12)
-    for msg, color in report['who_msgs']:
-        c.setFillColor(color); c.drawString(4*cm, y, msg); y -= 0.7*cm
+    c.setFont("Helvetica-Bold",14); c.drawString(3*cm,height-7*cm,"WHO Assessment:"); c.setFont("Helvetica",12)
+    for msg,color in report['who_msgs']:
+        c.setFillColor(color); c.drawString(4*cm,y,msg); y-=0.7*cm
     c.setFillColor(colors.black)
-    c.setFont("Helvetica-Bold", 14); c.drawString(3*cm, y-0.3*cm, "AI Recommendations:"); c.setFont("Helvetica", 12)
-    y -= 1*cm
+    c.setFont("Helvetica-Bold",14); c.drawString(3*cm,y-0.3*cm,"AI Recommendations:"); c.setFont("Helvetica",12)
+    y-=1*cm
     for rec in report['recommendations']:
-        c.drawString(4*cm, y, rec.replace("**","")); y -= 0.7*cm
-        if y < 5*cm: c.showPage(); y = height-3*cm
-
+        c.drawString(4*cm,y,rec.replace("**","")); y-=0.7*cm
+        if y<5*cm: c.showPage(); y=height-3*cm
     c.showPage(); c.save(); buffer.seek(0)
     return buffer
 
-# ------------------- WIX UPLOAD -------------------
-def upload_pdf_to_wix(pdf_buffer: BytesIO, filename: str) -> str:
-    headers = {"Authorization": f"Bearer {WIX_API_KEY}"}
-    files = {"file": (filename, pdf_buffer, "application/pdf")}
-    response = requests.post(WIX_MEDIA_UPLOAD_URL, headers=headers, files=files)
-    if response.status_code == 200:
-        return response.json()["fileUrl"]
+# ------------------- UPLOAD PDF TO WIX FUNCTION -------------------
+import base64
+def send_pdf_to_wix_http_function(child_name, child_id, pdf_buffer, filename):
+    pdf_bytes = pdf_buffer.getvalue()
+    pdf_base64 = base64.b64encode(pdf_bytes).decode('utf-8')
+    payload = {"childID": child_id, "childName": child_name, "pdfBase64": pdf_base64, "filename": filename}
+    response = requests.post(WIX_HTTP_FUNCTION_URL, json=payload)
+    if response.status_code==200:
+        st.success("PDF uploaded to Wix successfully!")
     else:
         st.error(f"Failed to upload PDF to Wix: {response.text}")
-        return None
-
-def send_pdf_link_to_wix(child_name: str, child_id: str, file_url: str):
-    payload = {"childID": child_id, "childName": child_name, "fileUrl": file_url}
-    response = requests.post(WIX_HTTP_FUNCTION_URL, json=payload)
-    if response.status_code == 200:
-        st.success("PDF uploaded and saved to Wix successfully!")
-    else:
-        st.error(f"Failed to save PDF in Wix collection: {response.text}")
 
 # ------------------- STREAMLIT INTERFACE -------------------
 st.title("🧒 Hybrid AI Child Growth Advisor with Wix PDF Upload")
@@ -242,24 +209,20 @@ with st.sidebar:
     st.header("Child's Measurements")
     child_name = st.text_input("Child's Name", value="John Doe")
     child_id = st.text_input("Child ID", value="C001")
-    sex_options = {"Male": "M", "Female": "F"}
+    sex_options = {"Male":"M","Female":"F"}
     sex_label = st.radio("Sex", options=sex_options.keys(), horizontal=True)
     sex = sex_options[sex_label]
     age_months = st.number_input("Age in Months", min_value=0, max_value=60, value=24, step=1)
-    height_cm = st.number_input("Height (cm)", min_value=40.0, max_value=130.0, value=85.0, step=0.1, format="%.1f")
-    weight_kg = st.number_input("Weight (kg)", min_value=1.0, max_value=40.0, value=12.0, step=0.1, format="%.1f")
+    height_cm = st.number_input("Height (cm)", min_value=40.0, max_value=130.0, value=85.0, step=0.1)
+    weight_kg = st.number_input("Weight (kg)", min_value=1.0, max_value=40.0, value=12.0, step=0.1)
     generate_button = st.button("Generate & Upload PDF", type="primary", use_container_width=True)
 
 if generate_button and growth_model and scaler:
-    with st.spinner('Analyzing...'):
+    with st.spinner("Analyzing..."):
         report = generate_report(int(age_months), float(height_cm), float(weight_kg), sex, growth_model, scaler)
     if report:
-        pdf_buffer = create_pdf_report(child_name, int(age_months), report)
+        pdf_buffer = create_pdf_report(child_name,int(age_months),report)
         st.download_button("📄 Download PDF", data=pdf_buffer, file_name=f"{child_name}_Growth_Report.pdf", mime="application/pdf")
-        
-        # Upload to Wix
-        file_url = upload_pdf_to_wix(pdf_buffer, f"{child_name}_Growth_Report.pdf")
-        if file_url:
-            send_pdf_link_to_wix(child_name, child_id, file_url)
+        send_pdf_to_wix_http_function(child_name, child_id, pdf_buffer, f"{child_name}_Growth_Report.pdf")
 elif not (growth_model and scaler):
     st.warning("Cannot generate report because AI model or scaler is not loaded.")
