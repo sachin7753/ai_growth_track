@@ -15,6 +15,7 @@ from reportlab.pdfgen import canvas
 from reportlab.lib.units import cm
 from reportlab.lib import colors
 import matplotlib.pyplot as plt
+import requests  # <-- For Wix integration
 
 # ------------------- PAGE CONFIG -------------------
 st.set_page_config(page_title="Child Growth Advisor", page_icon="🧒", layout="wide")
@@ -29,6 +30,11 @@ SCALER_PATH = "scaler.joblib"
 PARAMS_PATH = "best_params.json"
 DAYS_PER_MONTH = 30.4375
 CLASS_LABELS = {0:"Underweight", 1:"Healthy", 2:"Overweight", 3:"Obese", 4:"Stunted", 5:"Normal Ht"}
+
+# ------------------- WIX CONFIG -------------------
+WIX_MEDIA_UPLOAD_URL = "https://www.wixapis.com/media/v1/upload/file"  # Wix Media API
+WIX_API_KEY = "YOUR_WIX_API_KEY"  # Replace with your Wix API Key
+WIX_HTTP_FUNCTION_URL = "https://yourwixsite.com/_functions/addReport"  # Replace with your HTTP Function URL
 
 # ------------------- AI MODEL -------------------
 class GrowthNet(nn.Module):
@@ -171,120 +177,75 @@ def create_pdf_report(child_name: str, age_months: int, report: dict) -> BytesIO
     c = canvas.Canvas(buffer, pagesize=A4)
     width, height = A4
 
-    # Title
+    # Title & metrics (same as before)
     c.setFont("Helvetica-Bold", 16)
     c.drawString(3*cm, height-3*cm, f"Child Growth Report: {child_name}")
-
-    # Summary metrics
     c.setFont("Helvetica", 12)
     c.drawString(3*cm, height-4*cm, f"Age: {int(age_months)//12}y {int(age_months)%12}m")
     c.drawString(3*cm, height-4.7*cm, f"Height Percentile: P{report['hfa_p']:.1f}")
     c.drawString(3*cm, height-5.4*cm, f"Weight-for-Height Percentile: P{report['wfh_p']:.1f}")
     c.drawString(3*cm, height-6.1*cm, f"BMI: {report['bmi']:.1f}")
 
-    # WHO Assessment
-    c.setFont("Helvetica-Bold", 14)
-    c.drawString(3*cm, height-7*cm, "WHO Assessment:")
-    c.setFont("Helvetica", 12)
+    # WHO Assessment & AI Recommendations
     y = height-7.7*cm
+    c.setFont("Helvetica-Bold", 14); c.drawString(3*cm, height-7*cm, "WHO Assessment:"); c.setFont("Helvetica", 12)
     for msg, color in report['who_msgs']:
-        c.setFillColor(color)
-        c.drawString(4*cm, y, msg)
-        y -= 0.7*cm
+        c.setFillColor(color); c.drawString(4*cm, y, msg); y -= 0.7*cm
     c.setFillColor(colors.black)
-
-    # AI Recommendations
-    c.setFont("Helvetica-Bold", 14)
-    c.drawString(3*cm, y-0.3*cm, "AI Recommendations:")
-    c.setFont("Helvetica", 12)
+    c.setFont("Helvetica-Bold", 14); c.drawString(3*cm, y-0.3*cm, "AI Recommendations:"); c.setFont("Helvetica", 12)
     y -= 1*cm
     for rec in report['recommendations']:
-        c.drawString(4*cm, y, rec.replace("**",""))
-        y -= 0.7*cm
-        if y < 5*cm:
-            c.showPage(); y = height-3*cm
+        c.drawString(4*cm, y, rec.replace("**","")); y -= 0.7*cm; 
+        if y < 5*cm: c.showPage(); y = height-3*cm
 
-    # ------------------- PLOT CHART -------------------
-    plt.figure(figsize=(6,4))
-    hfa_x = list(report['hfa_curve'].keys())
-    hfa_y = list(report['hfa_curve'].values())
-    wfh_x = list(report['wfh_curve'].keys())
-    wfh_y = list(report['wfh_curve'].values())
-
-    plt.plot(hfa_x, hfa_y, label='Height-for-age curve', color='green')
-    plt.scatter([report['ht']], [report['ht']], color='blue', label='Child Height')
-    plt.xlabel("Percentile")
-    plt.ylabel("Height (cm)")
-    plt.title("Height-for-Age Percentile")
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig("hfa_chart.png"); plt.close()
-
-    plt.figure(figsize=(6,4))
-    plt.plot(wfh_x, wfh_y, label='Weight-for-height curve', color='orange')
-    plt.scatter([report['ht']], [report['wt']], color='red', label='Child Weight')
-    plt.xlabel("Percentile")
-    plt.ylabel("Weight (kg)")
-    plt.title("Weight-for-Height Percentile")
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig("wfh_chart.png"); plt.close()
-
-    # Embed charts in PDF
-    c.showPage()
-    c.drawImage("hfa_chart.png", 2*cm, height/2, width=16*cm, height=9*cm)
-    c.drawImage("wfh_chart.png", 2*cm, 2*cm, width=16*cm, height=9*cm)
-
-    c.showPage()
-    c.save()
-    buffer.seek(0)
+    c.showPage(); c.save(); buffer.seek(0)
     return buffer
 
+# ------------------- WIX UPLOAD -------------------
+def upload_pdf_to_wix(pdf_buffer: BytesIO, filename: str) -> str:
+    headers = {"Authorization": f"Bearer {WIX_API_KEY}"}
+    files = {"file": (filename, pdf_buffer, "application/pdf")}
+    response = requests.post(WIX_MEDIA_UPLOAD_URL, headers=headers, files=files)
+    if response.status_code == 200:
+        return response.json()["fileUrl"]
+    else:
+        st.error(f"Failed to upload PDF to Wix: {response.text}")
+        return None
+
+def send_pdf_link_to_wix(child_name: str, child_id: str, file_url: str):
+    payload = {"childID": child_id, "childName": child_name, "fileUrl": file_url}
+    response = requests.post(WIX_HTTP_FUNCTION_URL, json=payload)
+    if response.status_code == 200:
+        st.success("PDF uploaded and saved to Wix successfully!")
+    else:
+        st.error(f"Failed to save PDF in Wix collection: {response.text}")
+
 # ------------------- STREAMLIT INTERFACE -------------------
-st.title("🧒 Hybrid AI Child Growth Advisor with PDF Charts")
+st.title("🧒 Hybrid AI Child Growth Advisor with Wix PDF Upload")
 growth_model, scaler = load_model_and_scaler(MODEL_PATH, SCALER_PATH, PARAMS_PATH)
 
 with st.sidebar:
     st.header("Child's Measurements")
     child_name = st.text_input("Child's Name", value="John Doe")
+    child_id = st.text_input("Child ID", value="C001")
     sex_options = {"Male": "M", "Female": "F"}
     sex_label = st.radio("Sex", options=sex_options.keys(), horizontal=True)
     sex = sex_options[sex_label]
-
     age_months = st.number_input("Age in Months", min_value=0, max_value=60, value=24, step=1)
     height_cm = st.number_input("Height (cm)", min_value=40.0, max_value=130.0, value=85.0, step=0.1, format="%.1f")
     weight_kg = st.number_input("Weight (kg)", min_value=1.0, max_value=40.0, value=12.0, step=0.1, format="%.1f")
-    
-    generate_button = st.button("Generate Report", type="primary", use_container_width=True)
+    generate_button = st.button("Generate & Upload PDF", type="primary", use_container_width=True)
 
 if generate_button and growth_model and scaler:
     with st.spinner('Analyzing...'):
         report = generate_report(int(age_months), float(height_cm), float(weight_kg), sex, growth_model, scaler)
     if report:
-        st.header("Growth Report Summary")
-        col1, col2, col3, col4 = st.columns(4)
-        col1.metric("Age", f"{int(age_months) // 12}y {int(age_months) % 12}m")
-        col2.metric("Height Percentile", f"P{report['hfa_p']:.1f}")
-        col3.metric("Weight/Ht Percentile", f"P{report['wfh_p']:.1f}")
-        col4.metric("BMI", f"{report['bmi']:.1f}")
-        st.markdown("---")
-        
-        col_who, col_ai = st.columns(2)
-        with col_who:
-            st.subheader("📈 WHO Assessment")
-            for msg, color in report['who_msgs']:
-                st.markdown(f"- {msg}")
-        with col_ai:
-            st.subheader(f"🤖 AI Recommendations")
-            st.caption(f"Final Status: **{report['ai_status']}** | Model Confidence: **{report['confidence']:.1%}**")
-            for tip in report['recommendations']: st.markdown(f"- {tip}")
-
         pdf_buffer = create_pdf_report(child_name, int(age_months), report)
-        st.download_button(
-            label="📄 Download PDF Report",
-            data=pdf_buffer,
-            file_name=f"{child_name.replace(' ', '_')}_Growth_Report.pdf",
-            mime="application/pdf"
-        )
+        st.download_button("📄 Download PDF", data=pdf_buffer, file_name=f"{child_name}_Growth_Report.pdf", mime="application/pdf")
+        
+        # Upload to Wix
+        file_url = upload_pdf_to_wix(pdf_buffer, f"{child_name}_Growth_Report.pdf")
+        if file_url:
+            send_pdf_link_to_wix(child_name, child_id, file_url)
 elif not (growth_model and scaler):
     st.warning("Cannot generate report because AI model or scaler is not loaded.")
